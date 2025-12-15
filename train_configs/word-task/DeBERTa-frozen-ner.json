@@ -1,0 +1,18 @@
+{
+  "model_name_or_path": "microsoft/deberta-v3-large",
+  "model_class": "auto",
+  "dataset_name": "conll2003",
+  "task": "ner_tags",  
+  "max_seq_length": 512,
+  "per_device_train_batch_size": 8,
+  "per_device_eval_batch_size": 8,
+  "learning_rate": 5e-4,
+  "num_train_epochs": 3,  
+  "seed": 42,
+  "output_dir": "/home/maass/scripts/output/word-task/ner_tags/deberta_ner_frozen",
+  "eval_steps": 500,
+  "save_steps": 500,
+  "logging_steps": 100,
+  "merge_subwords": false,
+  "stop_after_n_steps": 3000
+}
