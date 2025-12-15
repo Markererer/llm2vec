@@ -262,6 +262,32 @@ The config files contain all the parameters and configurations used in our paper
 ``` 
 [train_configs/word-task](train_configs/word-task) and [test_configs/word-task](train_configs/word-task) contain similar configurations for Llama-2-7B, Mistral-7B, and Sheared-Llama-1.3B for all Uni, Bi, Bi-MNTP, and Bi-MNTP-SimCSE (LLM2Vec) variants. 
 
+### Word-level experiments for this thesis
+
+For the experiments in this thesis, we focus on word-level probing for Sheared LLaMA 1.3B and DeBERTa V3 Large on CoNLL-2003 (NER, POS) and UD English-EWT (XPOS/UPOS). All experiment configurations are defined as JSON files under `train_configs/word-task/` (for training) and `test_configs/word-task/` (for testing).
+
+To run training locally with a JSON config, use:
+
+```bash
+python experiments/run_word_task.py train_configs/word-task/ShearedLlama-bi-mntp_ner.json
+python experiments/run_word_task.py train_configs/word-task/ShearedLlama-bi-mntp_pos.json
+python experiments/run_word_task_ewt.py train_configs/word-task/ShearedLlama-bi-mntp_pos_ewt.json
+
+python experiments/run_word_task.py train_configs/word-task/DeBERTa-frozen-ner.json
+python experiments/run_word_task.py train_configs/word-task/DeBERTa-frozen-pos.json
+python experiments/run_word_task_ewt.py train_configs/word-task/DeBERTa-frozen-ewt.json
+```
+
+Each training config specifies the base model (`model_name_or_path`), optional MNTP checkpoint (`peft_addr`), dataset (`dataset_name`), task (`task`), training strategy (frozen vs full fine-tuning), and output directory. Corresponding test-time configurations in `test_configs/word-task/` can be run via:
+
+```bash
+python experiments/test_word_task.py --config_file test_configs/word-task/DeBERTa-frozen-ner.json
+python experiments/test_word_task_deberta.py --config_file test_configs/word-task/DeBERTa-frozen-ewt.json
+python experiments/test_word_task_ewt.py --config_file test_configs/word-task/ShearedLlama-bi-mntp_pos_ewt.json
+```
+
+On the HPC cluster used for this thesis, experiments are submitted via SLURM job scripts stored in the `jobs/` directory. Each `.job` file wraps a call to the appropriate Python experiment script in `llm2vec/experiments/` with a given JSON configuration, and manages resource allocation, logging, and checkpoint paths.
+
 
 ## Evaluation
 
@@ -299,3 +325,4 @@ url={https://openreview.net/forum?id=IW1PR7vEBf}
 
 ## Bugs or questions?
 If you have any questions about the code, feel free to open an issue on the GitHub repository.
+
