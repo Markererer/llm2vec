@@ -38,6 +38,11 @@ from transformers.utils.versions import require_version
 
 from llm2vec import LLM2Vec
 
+from dataclasses import dataclass, field
+@dataclass
+class TrainingArguments(TrainingArguments):
+    full_fine_tune: bool = field(default=False, metadata={"help": "Enable full fine-tuning (no freezing)."})
+
 require_version(
     "datasets>=1.8.0",
     "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt",
@@ -531,27 +536,6 @@ class StopTrainingCallback(TrainerCallback):
             control.should_training_stop = True
 
 
-class ClassifierSaveCallback(TrainerCallback):
-    """Callback to save classifier.pt for auto models (like DeBERTa) to maintain LLM2Vec compatibility"""
-    
-    def on_save(self, args, state, control, model=None, **kwargs):
-        if model is not None and hasattr(model, 'classifier'):
-            checkpoint_folder = f"checkpoint-{state.global_step}"
-            output_dir = os.path.join(args.output_dir, checkpoint_folder)
-            classifier_path = os.path.join(output_dir, "classifier.pt")
-            torch.save(model.classifier, classifier_path)
-            logger.info(f"Saved classifier.pt to {classifier_path}")
-    
-    def on_train_end(self, args, state, control, model=None, **kwargs):
-        # Also save at the end of training
-        if model is not None and hasattr(model, 'classifier'):
-            final_checkpoint = f"checkpoint-{state.global_step}"
-            output_dir = os.path.join(args.output_dir, final_checkpoint)
-            classifier_path = os.path.join(output_dir, "classifier.pt")
-            torch.save(model.classifier, classifier_path)
-            logger.info(f"Final classifier.pt saved to {classifier_path}")
-
-
 class WordTaskTrainer(Trainer):
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         # If we are executing this function, we are the process zero, so we don't check for that.
@@ -559,7 +543,45 @@ class WordTaskTrainer(Trainer):
         os.makedirs(output_dir, exist_ok=True)
         logger.info(f"Saving model checkpoint to {output_dir}")
 
-        torch.save(self.model.classifier, os.path.join(output_dir, "classifier.pt"))
+        # For full fine-tuning, save the entire model including the base model weights
+        if hasattr(self.args, 'full_fine_tune') and self.args.full_fine_tune:
+            logger.info("Full fine-tuning detected - saving complete model state dict")
+            
+            # Save using safetensors format (preferred) and pytorch_model.bin as backup
+            try:
+                from safetensors.torch import save_file
+                state_dict = self.model.state_dict()
+                save_file(state_dict, os.path.join(output_dir, "model.safetensors"))
+                logger.info(f"Saved model.safetensors with {len(state_dict)} parameters")
+            except ImportError:
+                logger.warning("safetensors not available, saving as pytorch_model.bin")
+                torch.save(self.model.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
+            
+            # Also save as pytorch_model.bin for compatibility
+            torch.save(self.model.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
+            
+            # Create a simple config.json for the full model
+            config_dict = {
+                "num_labels": self.model.num_labels,
+                "id2label": {str(i): label for i, label in enumerate(self.model.config.id2label.values())},
+                "label2id": self.model.config.label2id,
+                "torch_dtype": str(self.model.model.dtype),
+                "model_type": "ModelForWordTask"
+            }
+            
+            import json
+            with open(os.path.join(output_dir, "config.json"), 'w') as f:
+                json.dump(config_dict, f, indent=2)
+            
+            # Also save classifier separately for backward compatibility
+            torch.save(self.model.classifier, os.path.join(output_dir, "classifier.pt"))
+            logger.info(f"Saved full model state dict with {sum(p.numel() for p in self.model.parameters())} total parameters")
+            logger.info(f"Saved {len(self.model.state_dict())} parameter tensors")
+        else:
+            # Only save classifier for PEFT/frozen training
+            logger.info("PEFT/frozen training detected - saving only classifier")
+            torch.save(self.model.classifier, os.path.join(output_dir, "classifier.pt"))
+        
         self.tokenizer.save_pretrained(output_dir)
 
         # Good practice: save your training arguments together with the trained model
@@ -788,25 +810,15 @@ def main():
         raise ValueError(
             f"{model_args.model_class} is not implemented. Only 'auto' and 'custom' model_class options are valid."
         )
-
-    # only train classifier
-    trainable_params = 0
-    total_params = 0
-    for n, p in list(model.named_parameters()):
-        if model_args.model_class == "auto":
-            # For auto models (like DeBERTa), only train the classifier head
-            if "classifier" in n:
-                p.requires_grad = True
-                trainable_params += p.numel()
-            else:
-                p.requires_grad = False
-        else:
-            # For custom models, train all parameters
-            p.requires_grad = True
-            trainable_params += p.numel()
-        total_params += p.numel()
     
-    logger.info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
+
+    # Full FT: All params trainable
+    for p in model.parameters():
+        p.requires_grad = True
+    # Set the full_fine_tune flag so the save method knows to save all parameters
+    training_args.full_fine_tune = True
+    print(f"Full fine-tuning enabled: {sum(p.numel() for p in model.parameters() if p.requires_grad)} trainable params.")
+    
 
 
     if data_args.max_seq_length is None:
@@ -889,36 +901,40 @@ def main():
         load_from_cache_file=not data_args.overwrite_cache,
     )
     data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
-    seqeval = evaluate.load("seqeval")
+    
+    # Load appropriate metrics for token classification (not seqeval which is for NER)
+    accuracy_metric = evaluate.load("accuracy")
+    precision_metric = evaluate.load("precision")
+    recall_metric = evaluate.load("recall")
+    f1_metric = evaluate.load("f1")
 
     def compute_metrics(p):
         predictions, labels = p
-        predictions = predictions[0]
+        # Handle different prediction formats
+        if len(predictions) == 2:
+            predictions = predictions[0]
         predictions = np.argmax(predictions, axis=2)
 
-        true_predictions = [
-            [
-                config_kwargs["id2label"][p]
-                for (p, l) in zip(prediction, label)
-                if l != -100
-            ]
-            for prediction, label in zip(predictions, labels)
-        ]
-        true_labels = [
-            [
-                config_kwargs["id2label"][l]
-                for (p, l) in zip(prediction, label)
-                if l != -100
-            ]
-            for prediction, label in zip(predictions, labels)
-        ]
+        # Flatten predictions and labels, filtering out -100 labels
+        true_predictions = []
+        true_labels = []
+        for prediction, label in zip(predictions, labels):
+            for p, l in zip(prediction, label):
+                if l != -100:
+                    true_predictions.append(p)
+                    true_labels.append(l)
 
-        results = seqeval.compute(predictions=true_predictions, references=true_labels)
+        # Calculate token-level metrics for POS tagging
+        accuracy = accuracy_metric.compute(predictions=true_predictions, references=true_labels)["accuracy"]
+        precision = precision_metric.compute(predictions=true_predictions, references=true_labels, average="macro")["precision"]
+        recall = recall_metric.compute(predictions=true_predictions, references=true_labels, average="macro")["recall"]
+        f1 = f1_metric.compute(predictions=true_predictions, references=true_labels, average="macro")["f1"]
+
         return {
-            "precision": results["overall_precision"],
-            "recall": results["overall_recall"],
-            "f1": results["overall_f1"],
-            "accuracy": results["overall_accuracy"],
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "accuracy": accuracy,
         }
 
     trainer = MyTrainer(
@@ -931,10 +947,6 @@ def main():
         compute_metrics=compute_metrics,
     )
     trainer.add_callback(StopTrainingCallback(custom_args.stop_after_n_steps))
-    
-    # Add classifier saving callback for auto models to maintain LLM2Vec compatibility
-    if model_args.model_class == "auto":
-        trainer.add_callback(ClassifierSaveCallback())
 
     trainer.train()
 

@@ -105,6 +105,60 @@ LABELS = {
             "B-MISC": 7,
             "I-MISC": 8,
         },
+    },
+    "universal_dependencies": {
+    "pos_tags": {
+        "$": 0,
+        "''": 1,
+        ",": 2,
+        "-LRB-": 3,
+        "-RRB-": 4,
+        ".": 5,
+        ":": 6,
+        "ADD": 7,
+        "AFX": 8,
+        "CC": 9,
+        "CD": 10,
+        "DT": 11,
+        "EX": 12,
+        "FW": 13,
+        "GW": 14,
+        "HYPH": 15,
+        "IN": 16,
+        "JJ": 17,
+        "JJR": 18,
+        "JJS": 19,
+        "LS": 20,
+        "MD": 21,
+        "NFP": 22,
+        "NN": 23,
+        "NNP": 24,
+        "NNPS": 25,
+        "NNS": 26,
+        "PDT": 27,
+        "POS": 28,
+        "PRP": 29,
+        "PRP$": 30,
+        "RB": 31,
+        "RBR": 32,
+        "RBS": 33,
+        "RP": 34,
+        "SYM": 35,
+        "TO": 36,
+        "UH": 37,
+        "VB": 38,
+        "VBD": 39,
+        "VBG": 40,
+        "VBN": 41,
+        "VBP": 42,
+        "VBZ": 43,
+        "WDT": 44,
+        "WP": 45,
+        "WP$": 46,
+        "WRB": 47,
+        "XX": 48,
+        "``": 49
+        }
     }
 }
 
@@ -161,6 +215,7 @@ if __name__ == "__main__":
         choices=["next_token", "same_token"],
     )
     parser.add_argument("--dataset_name", default=None, type=str)
+    parser.add_argument("--dataset_config_name", default=None, type=str)
     parser.add_argument(
         "--task", default=None, type=str, choices=["pos_tags", "chunk_tags", "ner_tags"]
     )
@@ -208,9 +263,10 @@ if __name__ == "__main__":
     if args.model_class == "auto":
         assert not args.merge_subwords
 
-    assert (
-        args.dataset_name in LABELS and args.task in LABELS[args.dataset_name]
-    ), f"LABELS[{args.dataset_name}][{args.task}] is not defined."
+    if args.dataset_name != "universal_dependencies":
+        assert (
+            args.dataset_name in LABELS and args.task in LABELS[args.dataset_name]
+        ), f"LABELS[{args.dataset_name}][{args.task}] is not defined."
 
     config_kwargs = {
         "num_labels": len(LABELS[args.dataset_name][args.task]),
@@ -223,50 +279,9 @@ if __name__ == "__main__":
 
     if args.model_class == "custom":
         if args.model_name_or_path:
-            try:
-                config = AutoConfig.from_pretrained(
-                    args.model_name_or_path, **config_kwargs
-                )
-            except (ValueError, KeyError) as e:
-                if "ModelForWordTask" in str(e):
-                    print(f"Warning: Saved model has incompatible config type 'ModelForWordTask'.")
-                    print(f"Loading saved config manually and adapting...")
-                    
-                    # Load the saved config.json directly and extract the base model info
-                    import json
-                    config_path = os.path.join(args.model_name_or_path, "config.json")
-                    if os.path.exists(config_path):
-                        with open(config_path, 'r') as f:
-                            saved_config = json.load(f)
-                        
-                        # Extract base model name from peft_addr or infer from path
-                        if "Sheared" in args.model_name_or_path or (args.peft_addr and "Sheared" in args.peft_addr):
-                            base_model_path = "princeton-nlp/Sheared-LLaMA-1.3B"
-                        elif "DeBERTa" in args.model_name_or_path or (args.peft_addr and "DeBERTa" in args.peft_addr):
-                            base_model_path = "microsoft/deberta-v3-large"
-                        else:
-                            base_model_path = args.peft_addr if args.peft_addr else "princeton-nlp/Sheared-LLaMA-1.3B"
-                        
-                        print(f"Using base model config from: {base_model_path}")
-                        config = AutoConfig.from_pretrained(base_model_path, **config_kwargs)
-                        
-                        # Override with saved task-specific config
-                        if "num_labels" in saved_config:
-                            config.num_labels = saved_config["num_labels"]
-                        if "id2label" in saved_config:
-                            config.id2label = saved_config["id2label"] 
-                        if "label2id" in saved_config:
-                            config.label2id = saved_config["label2id"]
-                        if "classifier_dropout" in saved_config:
-                            config.classifier_dropout = saved_config.get("classifier_dropout", 0.1)
-                        
-                        print(f"Successfully loaded task config with {config.num_labels} labels")
-                    else:
-                        print(f"No config.json found, using base model config")
-                        base_model_path = "princeton-nlp/Sheared-LLaMA-1.3B" if "Sheared" in args.model_name_or_path else "microsoft/deberta-v3-large"
-                        config = AutoConfig.from_pretrained(base_model_path, **config_kwargs)
-                else:
-                    raise e
+            config = AutoConfig.from_pretrained(
+                args.model_name_or_path, **config_kwargs
+            )
         else:
             raise ValueError("Invalid config loading")
 
@@ -278,21 +293,8 @@ if __name__ == "__main__":
             if args.torch_dtype in ["auto", None]
             else getattr(torch, args.torch_dtype)
         )
-        # For fully fine-tuned models, we need to use the original base model, not checkpoints
-        # Determine the base model name (never use checkpoint paths for base_model_name_or_path)
-        if "Sheared" in args.model_name_or_path or (args.peft_addr and "Sheared" in args.peft_addr):
-            base_model_for_l2v = "princeton-nlp/Sheared-LLaMA-1.3B"
-            print(f"Using Sheared-LLaMA base model: {base_model_for_l2v}")
-        elif "DeBERTa" in args.model_name_or_path or (args.peft_addr and "DeBERTa" in args.peft_addr):
-            base_model_for_l2v = "microsoft/deberta-v3-large"
-            print(f"Using DeBERTa base model: {base_model_for_l2v}")
-        else:
-            # If not a checkpoint path, use as-is
-            base_model_for_l2v = args.model_name_or_path
-            print(f"Using model path: {base_model_for_l2v}")
-        
         l2v = LLM2Vec.from_pretrained(
-            base_model_name_or_path=base_model_for_l2v,
+            base_model_name_or_path=args.model_name_or_path,
             enable_bidirectional=args.bidirectional,
             peft_model_name_or_path=args.peft_addr,
             merge_peft=False,
@@ -306,93 +308,12 @@ if __name__ == "__main__":
             torch_dtype=torch_dtype,
         )
 
-        # Check if we have a fully fine-tuned model (model.safetensors or pytorch_model.bin)
-        safetensors_path = os.path.join(args.cls_addr, "model.safetensors")
-        pytorch_model_path = os.path.join(args.cls_addr, "pytorch_model.bin")
         classifier_path = os.path.join(args.cls_addr, "classifier.pt")
-        config_path = os.path.join(args.cls_addr, "config.json")
-        
-        if os.path.exists(safetensors_path) and os.path.exists(config_path):
-            print(f"Loading fully fine-tuned model from safetensors: {args.cls_addr}")
-            try:
-                from safetensors.torch import load_file
-                # Load the complete fully fine-tuned model state dict
-                saved_state_dict = load_file(safetensors_path, device='cpu')
-                
-                # Filter out incompatible keys if needed
-                model_dict = model.state_dict()
-                filtered_state_dict = {}
-                skipped_keys = []
-                
-                for k, v in saved_state_dict.items():
-                    if k in model_dict and model_dict[k].shape == v.shape:
-                        filtered_state_dict[k] = v
-                    else:
-                        skipped_keys.append(k)
-                
-                if skipped_keys:
-                    print(f"Skipped incompatible parameters: {skipped_keys[:5]}{'...' if len(skipped_keys) > 5 else ''}")
-                
-                # Load the filtered state dict
-                missing_keys, unexpected_keys = model.load_state_dict(filtered_state_dict, strict=False)
-                if missing_keys:
-                    print(f"Missing keys: {missing_keys[:3]}{'...' if len(missing_keys) > 3 else ''}")
-                
-                print(f"✅ Loaded complete fully fine-tuned model with {sum(p.numel() for p in model.parameters())} parameters")
-                print(f"Loaded {len(filtered_state_dict)} parameters from safetensors")
-                
-            except Exception as e:
-                print(f"Failed to load safetensors model: {e}")
-                print("Falling back to classifier-only approach...")
-                if os.path.exists(classifier_path):
-                    classifier = torch.load(classifier_path, map_location='cpu')
-                    if torch_dtype != "auto":
-                        classifier = classifier.to(torch_dtype)
-                    model.classifier = classifier
-                    print(f"✅ Loaded base model + classifier with {sum(p.numel() for p in model.parameters())} parameters")
-                else:
-                    raise ValueError(f"Could not load safetensors and no classifier.pt found in {args.cls_addr}")
-            
-        elif os.path.exists(pytorch_model_path):
-            print(f"Loading fully fine-tuned model weights from pytorch_model.bin")
-            # Method 2: Load the saved model state dict
-            try:
-                saved_state_dict = torch.load(pytorch_model_path, map_location='cpu')
-                # Filter out incompatible keys if needed
-                model_dict = model.state_dict()
-                filtered_state_dict = {}
-                for k, v in saved_state_dict.items():
-                    if k in model_dict and model_dict[k].shape == v.shape:
-                        filtered_state_dict[k] = v
-                    else:
-                        print(f"Skipping incompatible parameter: {k}")
-                
-                model.load_state_dict(filtered_state_dict, strict=False)
-                print(f"✅ Loaded complete fine-tuned model with {sum(p.numel() for p in model.parameters())} parameters")
-            except Exception as e:
-                print(f"Failed to load pytorch_model.bin: {e}")
-                print("Falling back to classifier-only approach...")
-                if os.path.exists(classifier_path):
-                    classifier = torch.load(classifier_path, map_location='cpu')
-                    if torch_dtype != "auto":
-                        classifier = classifier.to(torch_dtype)
-                    model.classifier = classifier
-                    print(f"✅ Loaded base model + classifier with {sum(p.numel() for p in model.parameters())} parameters")
-                else:
-                    raise ValueError(f"Could not load pytorch_model.bin and no classifier.pt found in {args.cls_addr}")
-            
-        elif os.path.exists(classifier_path):
-            print(f"Loading base model + classifier approach from {classifier_path}")
-            # Method 3: Base model (from original checkpoint) + trained classifier
-            classifier = torch.load(classifier_path, map_location='cpu')
-            # Ensure classifier dtype matches model dtype
-            if torch_dtype != "auto":
-                classifier = classifier.to(torch_dtype)
-            model.classifier = classifier
-            print(f"✅ Loaded base model + classifier with {sum(p.numel() for p in model.parameters())} parameters")
-            
+        if os.path.exists(classifier_path):
+            print(f"Loading classifier from {classifier_path}")
+            model.classifier = torch.load(classifier_path)
         else:
-            raise ValueError(f"No model weights found in {args.cls_addr}. Looked for: model.safetensors, pytorch_model.bin, classifier.pt")
+            raise ValueError("classifier does not exist in", classifier_path)
 
     elif args.model_class == "auto":
         model = AutoModelForTokenClassification.from_pretrained(
@@ -410,7 +331,28 @@ if __name__ == "__main__":
 
     model = model.cuda()
 
-    raw_datasets = load_dataset(args.dataset_name, split="test")
+    if args.dataset_name == "universal_dependencies":
+        raw_datasets = load_dataset(args.dataset_name, args.dataset_config_name, split="test")
+        # Rename xpos to pos_tags
+        raw_datasets = raw_datasets.rename_column("xpos", "pos_tags")
+        
+        # Dynamically extract labels
+        all_labels = set()
+        for example in raw_datasets:
+            all_labels.update([label for label in example["pos_tags"] if label is not None])
+        
+        label_list = sorted(list(all_labels))
+        LABELS["universal_dependencies"]["pos_tags"] = {label: i for i, label in enumerate(label_list)}
+        
+        config_kwargs = {
+            "num_labels": len(label_list),
+            "id2label": {i: label for i, label in enumerate(label_list)},
+            "label2id": {label: i for i, label in enumerate(label_list)},
+            "classifier_dropout": args.classifier_dropout,
+        }
+    else:
+        raw_datasets = load_dataset(args.dataset_name, split="test")
+        
 
     def tokenize_and_align_labels(examples):
         task = args.task
@@ -436,7 +378,10 @@ if __name__ == "__main__":
                     if word_idx is None:
                         label_ids.append(-100)
                     elif word_idx != previous_word_idx:
-                        label_ids.append(label[word_idx])
+                        if label[word_idx] is None:
+                            label_ids.append(-100)
+                        else:
+                            label_ids.append(config_kwargs["label2id"][label[word_idx]])
                     else:
                         label_ids.append(-100)
                     previous_word_idx = word_idx
@@ -451,7 +396,10 @@ if __name__ == "__main__":
                     if word_idx is None:
                         label_ids.append(-100)
                     elif word_idx != previous_word_idx:
-                        label_ids.append(label[word_idx])
+                        if label[word_idx] is None:
+                            label_ids.append(-100)
+                        else:
+                            label_ids.append(config_kwargs["label2id"][label[word_idx]])
                     else:
                         label_ids.append(-100)
                     previous_word_idx = word_idx
@@ -473,7 +421,7 @@ if __name__ == "__main__":
     tokenized_dataset = raw_datasets.map(
         tokenize_and_align_labels,
         batched=True,
-        remove_columns=list(LABELS[args.dataset_name].keys()) + ["tokens", "id"],
+        remove_columns=["tokens", "idx"] if args.dataset_name == "universal_dependencies" else list(LABELS[args.dataset_name].keys()) + ["tokens", "id"],
     )
     with torch.no_grad():
         predictions = None

@@ -1,5 +1,6 @@
 """
 The script is adapted from https://huggingface.co/docs/transformers/en/tasks/token_classification
+Combined script for unfrozen training on EWT dataset
 """
 
 import logging
@@ -13,6 +14,7 @@ from typing import List, Optional, Tuple, Union
 import datasets
 import evaluate
 from datasets import load_dataset
+
 
 import torch
 from torch import nn
@@ -370,9 +372,13 @@ class ModelArguments:
             self.config_name is not None or self.model_name_or_path is not None
         ):
             raise ValueError(
-                "--config_overrides can't be used in combination with --config_name or --model_name_or_path"
+                "--config_overrides can't be used in combination with --config_name or --model_name_or --path"
             )
 
+
+@dataclass
+class TrainingArguments(TrainingArguments):
+    full_fine_tune: bool = field(default=False, metadata={"help": "Enable full fine-tuning (no freezing)."})
 
 @dataclass
 class DataTrainingArguments:
@@ -490,7 +496,6 @@ class DataTrainingArguments:
                     )
 
 
-# add more arguments
 @dataclass
 class CustomArguments:
     """
@@ -531,27 +536,6 @@ class StopTrainingCallback(TrainerCallback):
             control.should_training_stop = True
 
 
-class ClassifierSaveCallback(TrainerCallback):
-    """Callback to save classifier.pt for auto models (like DeBERTa) to maintain LLM2Vec compatibility"""
-    
-    def on_save(self, args, state, control, model=None, **kwargs):
-        if model is not None and hasattr(model, 'classifier'):
-            checkpoint_folder = f"checkpoint-{state.global_step}"
-            output_dir = os.path.join(args.output_dir, checkpoint_folder)
-            classifier_path = os.path.join(output_dir, "classifier.pt")
-            torch.save(model.classifier, classifier_path)
-            logger.info(f"Saved classifier.pt to {classifier_path}")
-    
-    def on_train_end(self, args, state, control, model=None, **kwargs):
-        # Also save at the end of training
-        if model is not None and hasattr(model, 'classifier'):
-            final_checkpoint = f"checkpoint-{state.global_step}"
-            output_dir = os.path.join(args.output_dir, final_checkpoint)
-            classifier_path = os.path.join(output_dir, "classifier.pt")
-            torch.save(model.classifier, classifier_path)
-            logger.info(f"Final classifier.pt saved to {classifier_path}")
-
-
 class WordTaskTrainer(Trainer):
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         # If we are executing this function, we are the process zero, so we don't check for that.
@@ -559,7 +543,33 @@ class WordTaskTrainer(Trainer):
         os.makedirs(output_dir, exist_ok=True)
         logger.info(f"Saving model checkpoint to {output_dir}")
 
-        torch.save(self.model.classifier, os.path.join(output_dir, "classifier.pt"))
+        # For full fine-tuning, save the entire model including the base model weights
+        if hasattr(self.args, 'full_fine_tune') and self.args.full_fine_tune:
+            logger.info("Full fine-tuning detected - saving complete model state dict")
+            # Save the entire model state dict (base model + classifier)
+            torch.save(self.model.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
+            
+            # Create a simple config.json for the full model
+            config_dict = {
+                "num_labels": self.model.num_labels,
+                "id2label": {str(i): label for i, label in enumerate(self.model.config.id2label.values())},
+                "label2id": self.model.config.label2id,
+                "torch_dtype": str(self.model.model.dtype),
+                "model_type": "ModelForWordTask"
+            }
+            
+            import json
+            with open(os.path.join(output_dir, "config.json"), 'w') as f:
+                json.dump(config_dict, f, indent=2)
+            
+            # Also save classifier separately for backward compatibility
+            torch.save(self.model.classifier, os.path.join(output_dir, "classifier.pt"))
+            logger.info(f"Saved full model state dict with {sum(p.numel() for p in self.model.parameters())} parameters")
+        else:
+            # Only save classifier for PEFT/frozen training
+            logger.info("PEFT/frozen training detected - saving only classifier")
+            torch.save(self.model.classifier, os.path.join(output_dir, "classifier.pt"))
+        
         self.tokenizer.save_pretrained(output_dir)
 
         # Good practice: save your training arguments together with the trained model
@@ -640,6 +650,7 @@ def main():
             cache_dir=model_args.cache_dir,
             token=model_args.token,
             streaming=data_args.streaming,
+            trust_remote_code=model_args.trust_remote_code
         )
         if "validation" not in raw_datasets.keys():
             raw_datasets["validation"] = load_dataset(
@@ -649,6 +660,7 @@ def main():
                 cache_dir=model_args.cache_dir,
                 token=model_args.token,
                 streaming=data_args.streaming,
+                trust_remote_code=model_args.trust_remote_code
             )
             raw_datasets["train"] = load_dataset(
                 data_args.dataset_name,
@@ -657,6 +669,7 @@ def main():
                 cache_dir=model_args.cache_dir,
                 token=model_args.token,
                 streaming=data_args.streaming,
+                trust_remote_code=model_args.trust_remote_code
             )
     else:
         data_files = {}
@@ -674,6 +687,15 @@ def main():
             cache_dir=model_args.cache_dir,
             token=model_args.token,
         )
+        # Rename to match expected field for pos_tags task
+        raw_datasets = raw_datasets.rename_column("xpos", "pos_tags")
+        label_feature = raw_datasets["train"].features["pos_tags"]
+        config_kwargs = {
+            "num_labels": label_feature.num_classes,
+            "id2label": {i: label for i, label in enumerate(label_feature.names)},
+            "label2id": {label: i for i, label in enumerate(label_feature.names)},
+            "classifier_dropout": model_args.classifier_dropout,
+        }
 
         # If no validation data is there, validation_split_percentage will be used to divide the dataset.
         if "validation" not in raw_datasets.keys():
@@ -683,6 +705,7 @@ def main():
                 split=f"train[:{data_args.validation_split_percentage}%]",
                 cache_dir=model_args.cache_dir,
                 token=model_args.token,
+                trust_remote_code=model_args.trust_remote_code
             )
             raw_datasets["train"] = load_dataset(
                 extension,
@@ -690,22 +713,45 @@ def main():
                 split=f"train[{data_args.validation_split_percentage}%:]",
                 cache_dir=model_args.cache_dir,
                 token=model_args.token,
+                trust_remote_code=model_args.trust_remote_code
             )
 
-    assert (
-        data_args.dataset_name in LABELS
-        and custom_args.task in LABELS[data_args.dataset_name]
-    ), f"LABELS[{data_args.dataset_name}][{custom_args.task}] is not defined."
+    # Handle both conll2003 and universal_dependencies datasets
+    if data_args.dataset_name == "universal_dependencies":
+        # For EWT dataset, rename xpos to pos_tags and dynamically extract labels
+        raw_datasets = raw_datasets.rename_column("xpos", "pos_tags")
+        
+        # Dynamically extract labels from the dataset
+        all_labels = set()
+        for example in raw_datasets["train"]:
+            # Filter out None values
+            all_labels.update([label for label in example["pos_tags"] if label is not None])
 
-    config_kwargs = {
-        "num_labels": len(LABELS[data_args.dataset_name][custom_args.task]),
-        "id2label": {
-            i: lab
-            for (lab, i) in LABELS[data_args.dataset_name][custom_args.task].items()
-        },
-        "label2id": LABELS[data_args.dataset_name][custom_args.task],
-        "classifier_dropout": model_args.classifier_dropout,
-    }
+        # Sort labels for consistency
+        label_list = sorted(list(all_labels))
+
+        config_kwargs = {
+            "num_labels": len(label_list),
+            "id2label": {i: label for i, label in enumerate(label_list)},
+            "label2id": {label: i for i, label in enumerate(label_list)},
+            "classifier_dropout": model_args.classifier_dropout,
+        }
+    else:
+        # For conll2003 dataset, use hardcoded labels
+        assert (
+            data_args.dataset_name in LABELS
+            and custom_args.task in LABELS[data_args.dataset_name]
+        ), f"LABELS[{data_args.dataset_name}][{custom_args.task}] is not defined."
+
+        config_kwargs = {
+            "num_labels": len(LABELS[data_args.dataset_name][custom_args.task]),
+            "id2label": {
+                i: lab
+                for (lab, i) in LABELS[data_args.dataset_name][custom_args.task].items()
+            },
+            "label2id": LABELS[data_args.dataset_name][custom_args.task],
+            "classifier_dropout": model_args.classifier_dropout,
+        }
 
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
@@ -789,25 +835,15 @@ def main():
             f"{model_args.model_class} is not implemented. Only 'auto' and 'custom' model_class options are valid."
         )
 
-    # only train classifier
+    # UNFROZEN TRAINING: All parameters trainable (full fine-tuning)
     trainable_params = 0
     total_params = 0
     for n, p in list(model.named_parameters()):
-        if model_args.model_class == "auto":
-            # For auto models (like DeBERTa), only train the classifier head
-            if "classifier" in n:
-                p.requires_grad = True
-                trainable_params += p.numel()
-            else:
-                p.requires_grad = False
-        else:
-            # For custom models, train all parameters
-            p.requires_grad = True
-            trainable_params += p.numel()
+        p.requires_grad = True  # Enable training for ALL parameters
+        trainable_params += p.numel()
         total_params += p.numel()
     
-    logger.info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
-
+    logger.info(f"UNFROZEN TRAINING - All parameters trainable: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
 
     if data_args.max_seq_length is None:
         max_seq_length = tokenizer.model_max_length
@@ -848,7 +884,10 @@ def main():
                     if word_idx is None:
                         label_ids.append(-100)
                     elif word_idx != previous_word_idx:
-                        label_ids.append(label[word_idx])
+                        if label[word_idx] is None:
+                            label_ids.append(-100)
+                        else:
+                            label_ids.append(config_kwargs["label2id"][label[word_idx]])
                     else:
                         label_ids.append(-100)
                     previous_word_idx = word_idx
@@ -863,14 +902,22 @@ def main():
                     if word_idx is None:
                         label_ids.append(-100)
                     elif word_idx != previous_word_idx:
-                        label_ids.append(label[word_idx])
+                        if label[word_idx] is None:
+                            label_ids.append(-100)
+                        else:
+                            label_ids.append(config_kwargs["label2id"][label[word_idx]])
                     else:
                         label_ids.append(-100)
                     previous_word_idx = word_idx
-                label_ids.append(-100)
-                labels.append(label_ids[1:])
+                
+                # Shift labels: each token predicts the next token's label
+                label_ids = label_ids[1:] + [-100]
+                
+                # Shift word_ids accordingly
                 word_ids = word_ids[1:] + [None]
                 word_ids = [-1 if w is None else w for w in word_ids]
+                
+                labels.append(label_ids)
                 words.append(word_ids)
             else:
                 raise ValueError(
@@ -882,43 +929,67 @@ def main():
             tokenized_inputs["token_type_ids"] = words
         return tokenized_inputs
 
-    tokenized_dataset = raw_datasets.map(
-        tokenize_and_align_labels,
-        batched=True,
-        remove_columns=list(LABELS[data_args.dataset_name].keys()) + ["tokens", "id"],
-        load_from_cache_file=not data_args.overwrite_cache,
-    )
+    # Handle different dataset structures for column removal
+    if data_args.dataset_name == "universal_dependencies":
+        # For EWT dataset, remove columns that exist in this dataset
+        columns_to_remove = [col for col in raw_datasets["train"].column_names if col not in ["input_ids", "attention_mask", "labels", "token_type_ids"]]
+        import datasets as ds
+        tokenized_dataset = raw_datasets.map(
+            tokenize_and_align_labels,
+            batched=True,
+            remove_columns=columns_to_remove,
+            load_from_cache_file=False,  # Disable cache to avoid schema issues
+            features=ds.Features({
+                'input_ids': ds.Sequence(ds.Value('int64')),
+                'attention_mask': ds.Sequence(ds.Value('int64')),
+                'labels': ds.Sequence(ds.Value('int64')),
+                'token_type_ids': ds.Sequence(ds.Value('int64')),
+            }),
+        )
+    else:
+        # For conll2003 dataset
+        tokenized_dataset = raw_datasets.map(
+            tokenize_and_align_labels,
+            batched=True,
+            remove_columns=list(LABELS[data_args.dataset_name].keys()) + ["tokens", "id"],
+            load_from_cache_file=not data_args.overwrite_cache,
+        )
+        
     data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
-    seqeval = evaluate.load("seqeval")
+    
+    # Load appropriate metrics for token classification (not seqeval which is for NER)
+    accuracy_metric = evaluate.load("accuracy")
+    precision_metric = evaluate.load("precision")
+    recall_metric = evaluate.load("recall")
+    f1_metric = evaluate.load("f1")
 
     def compute_metrics(p):
         predictions, labels = p
-        predictions = predictions[0]
+        # Handle different prediction formats
+        if len(predictions) == 2:
+            predictions = predictions[0]
         predictions = np.argmax(predictions, axis=2)
 
-        true_predictions = [
-            [
-                config_kwargs["id2label"][p]
-                for (p, l) in zip(prediction, label)
-                if l != -100
-            ]
-            for prediction, label in zip(predictions, labels)
-        ]
-        true_labels = [
-            [
-                config_kwargs["id2label"][l]
-                for (p, l) in zip(prediction, label)
-                if l != -100
-            ]
-            for prediction, label in zip(predictions, labels)
-        ]
+        # Flatten predictions and labels, filtering out -100 labels
+        true_predictions = []
+        true_labels = []
+        for prediction, label in zip(predictions, labels):
+            for p, l in zip(prediction, label):
+                if l != -100:
+                    true_predictions.append(p)
+                    true_labels.append(l)
 
-        results = seqeval.compute(predictions=true_predictions, references=true_labels)
+        # Calculate token-level metrics for POS tagging
+        accuracy = accuracy_metric.compute(predictions=true_predictions, references=true_labels)["accuracy"]
+        precision = precision_metric.compute(predictions=true_predictions, references=true_labels, average="macro")["precision"]
+        recall = recall_metric.compute(predictions=true_predictions, references=true_labels, average="macro")["recall"]
+        f1 = f1_metric.compute(predictions=true_predictions, references=true_labels, average="macro")["f1"]
+
         return {
-            "precision": results["overall_precision"],
-            "recall": results["overall_recall"],
-            "f1": results["overall_f1"],
-            "accuracy": results["overall_accuracy"],
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "accuracy": accuracy,
         }
 
     trainer = MyTrainer(
@@ -931,10 +1002,6 @@ def main():
         compute_metrics=compute_metrics,
     )
     trainer.add_callback(StopTrainingCallback(custom_args.stop_after_n_steps))
-    
-    # Add classifier saving callback for auto models to maintain LLM2Vec compatibility
-    if model_args.model_class == "auto":
-        trainer.add_callback(ClassifierSaveCallback())
 
     trainer.train()
 

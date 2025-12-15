@@ -9,10 +9,12 @@ import warnings
 from dataclasses import dataclass, field
 import numpy as np
 from typing import List, Optional, Tuple, Union
+from sklearn.metrics import precision_recall_fscore_support
 
 import datasets
 import evaluate
 from datasets import load_dataset
+
 
 import torch
 from torch import nn
@@ -531,27 +533,6 @@ class StopTrainingCallback(TrainerCallback):
             control.should_training_stop = True
 
 
-class ClassifierSaveCallback(TrainerCallback):
-    """Callback to save classifier.pt for auto models (like DeBERTa) to maintain LLM2Vec compatibility"""
-    
-    def on_save(self, args, state, control, model=None, **kwargs):
-        if model is not None and hasattr(model, 'classifier'):
-            checkpoint_folder = f"checkpoint-{state.global_step}"
-            output_dir = os.path.join(args.output_dir, checkpoint_folder)
-            classifier_path = os.path.join(output_dir, "classifier.pt")
-            torch.save(model.classifier, classifier_path)
-            logger.info(f"Saved classifier.pt to {classifier_path}")
-    
-    def on_train_end(self, args, state, control, model=None, **kwargs):
-        # Also save at the end of training
-        if model is not None and hasattr(model, 'classifier'):
-            final_checkpoint = f"checkpoint-{state.global_step}"
-            output_dir = os.path.join(args.output_dir, final_checkpoint)
-            classifier_path = os.path.join(output_dir, "classifier.pt")
-            torch.save(model.classifier, classifier_path)
-            logger.info(f"Final classifier.pt saved to {classifier_path}")
-
-
 class WordTaskTrainer(Trainer):
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         # If we are executing this function, we are the process zero, so we don't check for that.
@@ -640,6 +621,7 @@ def main():
             cache_dir=model_args.cache_dir,
             token=model_args.token,
             streaming=data_args.streaming,
+            trust_remote_code=model_args.trust_remote_code
         )
         if "validation" not in raw_datasets.keys():
             raw_datasets["validation"] = load_dataset(
@@ -649,6 +631,7 @@ def main():
                 cache_dir=model_args.cache_dir,
                 token=model_args.token,
                 streaming=data_args.streaming,
+                trust_remote_code=model_args.trust_remote_code
             )
             raw_datasets["train"] = load_dataset(
                 data_args.dataset_name,
@@ -657,6 +640,7 @@ def main():
                 cache_dir=model_args.cache_dir,
                 token=model_args.token,
                 streaming=data_args.streaming,
+                trust_remote_code=model_args.trust_remote_code
             )
     else:
         data_files = {}
@@ -674,6 +658,15 @@ def main():
             cache_dir=model_args.cache_dir,
             token=model_args.token,
         )
+        task = custom_args.task  # "pos_tags" from JSON, but dataset uses "xpos"
+        raw_datasets = raw_datasets.rename_column("xpos", "pos_tags")  # Map to expected field
+        label_feature = raw_datasets["train"].features["pos_tags"]
+        config_kwargs = {
+            "num_labels": label_feature.num_classes,
+            "id2label": {i: label for i, label in enumerate(label_feature.names)},
+            "label2id": {label: i for i, label in enumerate(label_feature.names)},
+            "classifier_dropout": model_args.classifier_dropout,
+        }
 
         # If no validation data is there, validation_split_percentage will be used to divide the dataset.
         if "validation" not in raw_datasets.keys():
@@ -683,6 +676,7 @@ def main():
                 split=f"train[:{data_args.validation_split_percentage}%]",
                 cache_dir=model_args.cache_dir,
                 token=model_args.token,
+                trust_remote_code=model_args.trust_remote_code
             )
             raw_datasets["train"] = load_dataset(
                 extension,
@@ -690,20 +684,47 @@ def main():
                 split=f"train[{data_args.validation_split_percentage}%:]",
                 cache_dir=model_args.cache_dir,
                 token=model_args.token,
+                trust_remote_code=model_args.trust_remote_code
             )
+    # Rename to match expected field for pos_tags task
+    raw_datasets = raw_datasets.rename_column("xpos", "pos_tags")
 
-    assert (
-        data_args.dataset_name in LABELS
-        and custom_args.task in LABELS[data_args.dataset_name]
-    ), f"LABELS[{data_args.dataset_name}][{custom_args.task}] is not defined."
 
+
+#    assert (
+#        data_args.dataset_name in LABELS
+#        and custom_args.task in LABELS[data_args.dataset_name]
+#    ), f"LABELS[{data_args.dataset_name}][{custom_args.task}] is not defined."
+
+    
+    # For universal_dependencies, we need to define the POS tags properly
+    # These are the complete set of UD POS tags for English EWT
+    ud_pos_tags = {
+        "ADJ": 0, "ADP": 1, "ADV": 2, "AUX": 3, "CCONJ": 4, "DET": 5,
+        "INTJ": 6, "NOUN": 7, "NUM": 8, "PART": 9, "PRON": 10, "PROPN": 11,
+        "PUNCT": 12, "SCONJ": 13, "SYM": 14, "VERB": 15, "X": 16,
+        "!": 17, "\"": 18, "#": 19, "$": 20, "%": 21, "&": 22, "'": 23,
+        "(": 24, ")": 25, "*": 26, "+": 27, ",": 28, "-": 29, ".": 30,
+        "/": 31, ":": 32, ";": 33, "<": 34, "=": 35, ">": 36, "?": 37,
+        "@": 38, "^": 39, "`": 40, "{": 41, "|": 42, "}": 43, "~": 44,
+        "``": 45, "''": 46, "CC": 47, "CD": 48, "DT": 49
+    }
+    
+    # Extract labels from TRAINING data only (same as frozen script)
+    # This ensures consistent label2id mapping across frozen and unfrozen training
+    all_labels = set()
+    for example in raw_datasets["train"]:
+        # Filter out None values
+        all_labels.update([label for label in example["pos_tags"] if label is not None])
+
+    # Sort labels for consistency
+    label_list = sorted(list(all_labels))
+    logger.info(f"Extracted {len(label_list)} unique labels from training data: {label_list}")
+    
     config_kwargs = {
-        "num_labels": len(LABELS[data_args.dataset_name][custom_args.task]),
-        "id2label": {
-            i: lab
-            for (lab, i) in LABELS[data_args.dataset_name][custom_args.task].items()
-        },
-        "label2id": LABELS[data_args.dataset_name][custom_args.task],
+        "num_labels": len(label_list),
+        "id2label": {i: label for i, label in enumerate(label_list)},
+        "label2id": {label: i for i, label in enumerate(label_list)},
         "classifier_dropout": model_args.classifier_dropout,
     }
 
@@ -738,6 +759,14 @@ def main():
         tokenizer.model_input_names.append("token_type_ids")
     if model_args.model_class == "auto":
         assert not model_args.merge_subwords
+        # DeBERTa is bidirectional - force same_token labeling
+        if custom_args.retroactive_labels == "next_token":
+            logger.warning(
+                f"model_class='auto' (DeBERTa) is bidirectional and should use 'same_token' labels, "
+                f"but retroactive_labels='{custom_args.retroactive_labels}' was specified. "
+                f"Forcing retroactive_labels='same_token' for correct performance."
+            )
+            custom_args.retroactive_labels = "same_token"
 
     if model_args.model_class == "custom":
         if model_args.config_name:
@@ -789,25 +818,32 @@ def main():
             f"{model_args.model_class} is not implemented. Only 'auto' and 'custom' model_class options are valid."
         )
 
-    # only train classifier
+    # UNFROZEN TRAINING: Enable all parameters for full fine-tuning
     trainable_params = 0
     total_params = 0
-    for n, p in list(model.named_parameters()):
-        if model_args.model_class == "auto":
-            # For auto models (like DeBERTa), only train the classifier head
-            if "classifier" in n:
-                p.requires_grad = True
-                trainable_params += p.numel()
-            else:
-                p.requires_grad = False
-        else:
-            # For custom models, train all parameters
-            p.requires_grad = True
-            trainable_params += p.numel()
+    
+    # First, explicitly unfreeze the base model
+    if hasattr(model, 'deberta'):
+        for param in model.deberta.parameters():
+            param.requires_grad = True
+    
+    # Then unfreeze ALL parameters in the entire model
+    for n, p in model.named_parameters():
+        p.requires_grad = True
+        trainable_params += p.numel()
         total_params += p.numel()
     
-    logger.info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
-
+    logger.info(f"UNFROZEN TRAINING - All parameters trainable: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
+    
+    # Debug: Log model structure to see what we're dealing with
+    logger.info(f"Model structure: {type(model)}")
+    logger.info(f"Model has 'deberta' attr: {hasattr(model, 'deberta')}")
+    if hasattr(model, 'deberta'):
+        deberta_params = sum(p.numel() for p in model.deberta.parameters())
+        logger.info(f"DeBERTa backbone parameters: {deberta_params:,}")
+    if hasattr(model, 'classifier'):
+        classifier_params = sum(p.numel() for p in model.classifier.parameters())
+        logger.info(f"Classifier parameters: {classifier_params:,}")
 
     if data_args.max_seq_length is None:
         max_seq_length = tokenizer.model_max_length
@@ -848,7 +884,20 @@ def main():
                     if word_idx is None:
                         label_ids.append(-100)
                     elif word_idx != previous_word_idx:
-                        label_ids.append(label[word_idx])
+                        if label[word_idx] is None:
+                            label_ids.append(-100)
+                        else:
+                            # Defensive mapping: if label not in label2id, assign unknown or skip
+                            try:
+                                label_id = config_kwargs["label2id"][label[word_idx]]
+                            except KeyError:
+                                logger.warning(f"Label '{label[word_idx]}' not found in label2id. Adding it dynamically.")
+                                # Add unknown label
+                                new_id = len(config_kwargs["label2id"])
+                                config_kwargs["label2id"][label[word_idx]] = new_id
+                                config_kwargs["id2label"][new_id] = label[word_idx]
+                                label_id = new_id
+                            label_ids.append(label_id)
                     else:
                         label_ids.append(-100)
                     previous_word_idx = word_idx
@@ -863,14 +912,31 @@ def main():
                     if word_idx is None:
                         label_ids.append(-100)
                     elif word_idx != previous_word_idx:
-                        label_ids.append(label[word_idx])
+                        if label[word_idx] is None:
+                            label_ids.append(-100)
+                        else:
+                            # Defensive mapping
+                            try:
+                                label_id = config_kwargs["label2id"][label[word_idx]]
+                            except KeyError:
+                                logger.warning(f"Label '{label[word_idx]}' not found in label2id. Adding it dynamically.")
+                                new_id = len(config_kwargs["label2id"])
+                                config_kwargs["label2id"][label[word_idx]] = new_id
+                                config_kwargs["id2label"][new_id] = label[word_idx]
+                                label_id = new_id
+                            label_ids.append(label_id)
                     else:
                         label_ids.append(-100)
                     previous_word_idx = word_idx
-                label_ids.append(-100)
-                labels.append(label_ids[1:])
+                
+                # Shift labels: each token predicts the next token's label
+                label_ids = label_ids[1:] + [-100]
+                
+                # Shift word_ids accordingly
                 word_ids = word_ids[1:] + [None]
                 word_ids = [-1 if w is None else w for w in word_ids]
+                
+                labels.append(label_ids)
                 words.append(word_ids)
             else:
                 raise ValueError(
@@ -882,43 +948,76 @@ def main():
             tokenized_inputs["token_type_ids"] = words
         return tokenized_inputs
 
+    import datasets as ds
+
     tokenized_dataset = raw_datasets.map(
         tokenize_and_align_labels,
         batched=True,
-        remove_columns=list(LABELS[data_args.dataset_name].keys()) + ["tokens", "id"],
-        load_from_cache_file=not data_args.overwrite_cache,
+        remove_columns=raw_datasets["train"].column_names,
+        load_from_cache_file=False,  # Disable cache to avoid schema issues
+        features=ds.Features({
+            'input_ids': ds.Sequence(ds.Value('int64')),
+            'attention_mask': ds.Sequence(ds.Value('int64')),
+            'labels': ds.Sequence(ds.Value('int64')),
+            'token_type_ids': ds.Sequence(ds.Value('int64')),
+        }),
     )
     data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
-    seqeval = evaluate.load("seqeval")
 
     def compute_metrics(p):
         predictions, labels = p
-        predictions = predictions[0]
-        predictions = np.argmax(predictions, axis=2)
+        predictions = predictions[0] if isinstance(predictions, tuple) else predictions
+        
+        # DEBUG: Log prediction shape and first few values
+        logger.info(f"DEBUG compute_metrics - predictions shape: {predictions.shape}, dtype: {predictions.dtype}")
+        logger.info(f"DEBUG compute_metrics - labels shape: {labels.shape}, dtype: {labels.dtype}")
+        if predictions.shape[0] > 0:
+            logger.info(f"DEBUG compute_metrics - first prediction row (raw): {predictions[0, :5]}")
+        
+        # Always take argmax - predictions are logits with shape (batch, sequence, num_classes)
+        if len(predictions.shape) == 3:
+            predictions = np.argmax(predictions, axis=2)
+            logger.info(f"DEBUG compute_metrics - after argmax, predictions shape: {predictions.shape}")
+            if predictions.shape[0] > 0:
+                logger.info(f"DEBUG compute_metrics - first prediction row (after argmax): {predictions[0, :10]}")
+        else:
+            # Shouldn't happen, but fallback anyway
+            logger.warning(f"DEBUG compute_metrics - WARNING: unexpected prediction shape {predictions.shape}, taking argmax on axis -1")
+            predictions = np.argmax(predictions, axis=-1)
 
-        true_predictions = [
-            [
-                config_kwargs["id2label"][p]
-                for (p, l) in zip(prediction, label)
-                if l != -100
-            ]
-            for prediction, label in zip(predictions, labels)
-        ]
-        true_labels = [
-            [
-                config_kwargs["id2label"][l]
-                for (p, l) in zip(prediction, label)
-                if l != -100
-            ]
-            for prediction, label in zip(predictions, labels)
-        ]
-
-        results = seqeval.compute(predictions=true_predictions, references=true_labels)
+        # Flatten and filter out -100 labels for POS tagging accuracy
+        flat_predictions = []
+        flat_labels = []
+        
+        for prediction, label in zip(predictions, labels):
+            for p, l in zip(prediction, label):
+                if l != -100:  # Skip padding tokens
+                    flat_predictions.append(p)
+                    flat_labels.append(l)
+        
+        # Convert to numpy arrays
+        flat_predictions = np.array(flat_predictions)
+        flat_labels = np.array(flat_labels)
+        
+        logger.info(f"DEBUG compute_metrics - flat arrays shape: preds={flat_predictions.shape}, labels={flat_labels.shape}")
+        logger.info(f"DEBUG compute_metrics - first 10 predictions: {flat_predictions[:10]}")
+        logger.info(f"DEBUG compute_metrics - first 10 labels: {flat_labels[:10]}")
+        
+        # Calculate token-level accuracy (standard for POS tagging)
+        accuracy = (flat_predictions == flat_labels).mean()
+        logger.info(f"DEBUG compute_metrics - accuracy: {accuracy}")
+        
+        # Calculate per-class metrics
+        from sklearn.metrics import precision_recall_fscore_support
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            flat_labels, flat_predictions, average='weighted', zero_division=0
+        )
+        
         return {
-            "precision": results["overall_precision"],
-            "recall": results["overall_recall"],
-            "f1": results["overall_f1"],
-            "accuracy": results["overall_accuracy"],
+            "accuracy": accuracy,
+            "f1": f1,
+            "precision": precision,
+            "recall": recall,
         }
 
     trainer = MyTrainer(
@@ -931,10 +1030,6 @@ def main():
         compute_metrics=compute_metrics,
     )
     trainer.add_callback(StopTrainingCallback(custom_args.stop_after_n_steps))
-    
-    # Add classifier saving callback for auto models to maintain LLM2Vec compatibility
-    if model_args.model_class == "auto":
-        trainer.add_callback(ClassifierSaveCallback())
 
     trainer.train()
 

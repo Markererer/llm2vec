@@ -223,50 +223,9 @@ if __name__ == "__main__":
 
     if args.model_class == "custom":
         if args.model_name_or_path:
-            try:
-                config = AutoConfig.from_pretrained(
-                    args.model_name_or_path, **config_kwargs
-                )
-            except (ValueError, KeyError) as e:
-                if "ModelForWordTask" in str(e):
-                    print(f"Warning: Saved model has incompatible config type 'ModelForWordTask'.")
-                    print(f"Loading saved config manually and adapting...")
-                    
-                    # Load the saved config.json directly and extract the base model info
-                    import json
-                    config_path = os.path.join(args.model_name_or_path, "config.json")
-                    if os.path.exists(config_path):
-                        with open(config_path, 'r') as f:
-                            saved_config = json.load(f)
-                        
-                        # Extract base model name from peft_addr or infer from path
-                        if "Sheared" in args.model_name_or_path or (args.peft_addr and "Sheared" in args.peft_addr):
-                            base_model_path = "princeton-nlp/Sheared-LLaMA-1.3B"
-                        elif "DeBERTa" in args.model_name_or_path or (args.peft_addr and "DeBERTa" in args.peft_addr):
-                            base_model_path = "microsoft/deberta-v3-large"
-                        else:
-                            base_model_path = args.peft_addr if args.peft_addr else "princeton-nlp/Sheared-LLaMA-1.3B"
-                        
-                        print(f"Using base model config from: {base_model_path}")
-                        config = AutoConfig.from_pretrained(base_model_path, **config_kwargs)
-                        
-                        # Override with saved task-specific config
-                        if "num_labels" in saved_config:
-                            config.num_labels = saved_config["num_labels"]
-                        if "id2label" in saved_config:
-                            config.id2label = saved_config["id2label"] 
-                        if "label2id" in saved_config:
-                            config.label2id = saved_config["label2id"]
-                        if "classifier_dropout" in saved_config:
-                            config.classifier_dropout = saved_config.get("classifier_dropout", 0.1)
-                        
-                        print(f"Successfully loaded task config with {config.num_labels} labels")
-                    else:
-                        print(f"No config.json found, using base model config")
-                        base_model_path = "princeton-nlp/Sheared-LLaMA-1.3B" if "Sheared" in args.model_name_or_path else "microsoft/deberta-v3-large"
-                        config = AutoConfig.from_pretrained(base_model_path, **config_kwargs)
-                else:
-                    raise e
+            config = AutoConfig.from_pretrained(
+                args.model_name_or_path, **config_kwargs
+            )
         else:
             raise ValueError("Invalid config loading")
 
@@ -278,21 +237,8 @@ if __name__ == "__main__":
             if args.torch_dtype in ["auto", None]
             else getattr(torch, args.torch_dtype)
         )
-        # For fully fine-tuned models, we need to use the original base model, not checkpoints
-        # Determine the base model name (never use checkpoint paths for base_model_name_or_path)
-        if "Sheared" in args.model_name_or_path or (args.peft_addr and "Sheared" in args.peft_addr):
-            base_model_for_l2v = "princeton-nlp/Sheared-LLaMA-1.3B"
-            print(f"Using Sheared-LLaMA base model: {base_model_for_l2v}")
-        elif "DeBERTa" in args.model_name_or_path or (args.peft_addr and "DeBERTa" in args.peft_addr):
-            base_model_for_l2v = "microsoft/deberta-v3-large"
-            print(f"Using DeBERTa base model: {base_model_for_l2v}")
-        else:
-            # If not a checkpoint path, use as-is
-            base_model_for_l2v = args.model_name_or_path
-            print(f"Using model path: {base_model_for_l2v}")
-        
         l2v = LLM2Vec.from_pretrained(
-            base_model_name_or_path=base_model_for_l2v,
+            base_model_name_or_path=args.model_name_or_path,
             enable_bidirectional=args.bidirectional,
             peft_model_name_or_path=args.peft_addr,
             merge_peft=False,
@@ -306,93 +252,12 @@ if __name__ == "__main__":
             torch_dtype=torch_dtype,
         )
 
-        # Check if we have a fully fine-tuned model (model.safetensors or pytorch_model.bin)
-        safetensors_path = os.path.join(args.cls_addr, "model.safetensors")
-        pytorch_model_path = os.path.join(args.cls_addr, "pytorch_model.bin")
         classifier_path = os.path.join(args.cls_addr, "classifier.pt")
-        config_path = os.path.join(args.cls_addr, "config.json")
-        
-        if os.path.exists(safetensors_path) and os.path.exists(config_path):
-            print(f"Loading fully fine-tuned model from safetensors: {args.cls_addr}")
-            try:
-                from safetensors.torch import load_file
-                # Load the complete fully fine-tuned model state dict
-                saved_state_dict = load_file(safetensors_path, device='cpu')
-                
-                # Filter out incompatible keys if needed
-                model_dict = model.state_dict()
-                filtered_state_dict = {}
-                skipped_keys = []
-                
-                for k, v in saved_state_dict.items():
-                    if k in model_dict and model_dict[k].shape == v.shape:
-                        filtered_state_dict[k] = v
-                    else:
-                        skipped_keys.append(k)
-                
-                if skipped_keys:
-                    print(f"Skipped incompatible parameters: {skipped_keys[:5]}{'...' if len(skipped_keys) > 5 else ''}")
-                
-                # Load the filtered state dict
-                missing_keys, unexpected_keys = model.load_state_dict(filtered_state_dict, strict=False)
-                if missing_keys:
-                    print(f"Missing keys: {missing_keys[:3]}{'...' if len(missing_keys) > 3 else ''}")
-                
-                print(f"✅ Loaded complete fully fine-tuned model with {sum(p.numel() for p in model.parameters())} parameters")
-                print(f"Loaded {len(filtered_state_dict)} parameters from safetensors")
-                
-            except Exception as e:
-                print(f"Failed to load safetensors model: {e}")
-                print("Falling back to classifier-only approach...")
-                if os.path.exists(classifier_path):
-                    classifier = torch.load(classifier_path, map_location='cpu')
-                    if torch_dtype != "auto":
-                        classifier = classifier.to(torch_dtype)
-                    model.classifier = classifier
-                    print(f"✅ Loaded base model + classifier with {sum(p.numel() for p in model.parameters())} parameters")
-                else:
-                    raise ValueError(f"Could not load safetensors and no classifier.pt found in {args.cls_addr}")
-            
-        elif os.path.exists(pytorch_model_path):
-            print(f"Loading fully fine-tuned model weights from pytorch_model.bin")
-            # Method 2: Load the saved model state dict
-            try:
-                saved_state_dict = torch.load(pytorch_model_path, map_location='cpu')
-                # Filter out incompatible keys if needed
-                model_dict = model.state_dict()
-                filtered_state_dict = {}
-                for k, v in saved_state_dict.items():
-                    if k in model_dict and model_dict[k].shape == v.shape:
-                        filtered_state_dict[k] = v
-                    else:
-                        print(f"Skipping incompatible parameter: {k}")
-                
-                model.load_state_dict(filtered_state_dict, strict=False)
-                print(f"✅ Loaded complete fine-tuned model with {sum(p.numel() for p in model.parameters())} parameters")
-            except Exception as e:
-                print(f"Failed to load pytorch_model.bin: {e}")
-                print("Falling back to classifier-only approach...")
-                if os.path.exists(classifier_path):
-                    classifier = torch.load(classifier_path, map_location='cpu')
-                    if torch_dtype != "auto":
-                        classifier = classifier.to(torch_dtype)
-                    model.classifier = classifier
-                    print(f"✅ Loaded base model + classifier with {sum(p.numel() for p in model.parameters())} parameters")
-                else:
-                    raise ValueError(f"Could not load pytorch_model.bin and no classifier.pt found in {args.cls_addr}")
-            
-        elif os.path.exists(classifier_path):
-            print(f"Loading base model + classifier approach from {classifier_path}")
-            # Method 3: Base model (from original checkpoint) + trained classifier
-            classifier = torch.load(classifier_path, map_location='cpu')
-            # Ensure classifier dtype matches model dtype
-            if torch_dtype != "auto":
-                classifier = classifier.to(torch_dtype)
-            model.classifier = classifier
-            print(f"✅ Loaded base model + classifier with {sum(p.numel() for p in model.parameters())} parameters")
-            
+        if os.path.exists(classifier_path):
+            print(f"Loading classifier from {classifier_path}")
+            model.classifier = torch.load(classifier_path)
         else:
-            raise ValueError(f"No model weights found in {args.cls_addr}. Looked for: model.safetensors, pytorch_model.bin, classifier.pt")
+            raise ValueError("classifier does not exist in", classifier_path)
 
     elif args.model_class == "auto":
         model = AutoModelForTokenClassification.from_pretrained(
@@ -403,12 +268,87 @@ if __name__ == "__main__":
             },
             label2id=LABELS[args.dataset_name][args.task],
         )
-    else:
-        raise ValueError(
-            f"{args.model_class} is not implemented. Only auto and custom model_class options are valid."
-        )
+        
+        # Load the trained classifier weights if cls_addr is provided
+        classifier_path = os.path.join(args.cls_addr, "classifier.pt")
+        if os.path.exists(classifier_path):
+            print(f"Loading classifier from {classifier_path}")
+            
+            # Check original classifier state
+            print(f"Original model classifier weight sum: {model.classifier.weight.sum().item():.6f}")
+            print(f"Original model classifier bias sum: {model.classifier.bias.sum().item():.6f}")
+            print(f"Original model classifier shape: {model.classifier.weight.shape}")
+            
+            trained_classifier = torch.load(classifier_path, map_location='cpu')
+            print(f"Loaded classifier weight sum: {trained_classifier.weight.sum().item():.6f}")
+            print(f"Loaded classifier bias sum: {trained_classifier.bias.sum().item():.6f}")
+            print(f"Loaded classifier shape: {trained_classifier.weight.shape}")
+            
+            # Verify dimensions match before replacing
+            if model.classifier.weight.shape == trained_classifier.weight.shape:
+                # Replace the entire classifier module
+                model.classifier = trained_classifier
+                print(f"Classifier module replaced successfully")
+                
+                # Verify replacement worked
+                print(f"After replacement - classifier weight sum: {model.classifier.weight.sum().item():.6f}")
+                print(f"After replacement - classifier bias sum: {model.classifier.bias.sum().item():.6f}")
+                
+                # Verify the classifier is part of the model
+                print(f"Classifier requires_grad: {model.classifier.weight.requires_grad}")
+                print(f"Model has classifier: {hasattr(model, 'classifier')}")
+                print(f"Classifier type: {type(model.classifier)}")
+                
+            else:
+                print(f"ERROR: Classifier dimension mismatch!")
+                print(f"Expected: {model.classifier.weight.shape}, Got: {trained_classifier.weight.shape}")
+                raise ValueError("Classifier dimensions do not match!")
+            
+        else:
+            print(f"Warning: classifier.pt not found at {classifier_path}")
 
+    # Freeze all parameters except classifier (to match training setup for auto models)
+    if args.model_class == "auto":
+        for name, param in model.named_parameters():
+            if "classifier" not in name:
+                param.requires_grad = False
+        print("Parameters frozen to match training setup")
+    
+    # Move model to CUDA after loading classifier
+    print(f"Before CUDA transfer - classifier weight sum: {model.classifier.weight.sum().item():.6f}")
+    print(f"Before CUDA transfer - classifier bias sum: {model.classifier.bias.sum().item():.6f}")
+    print(f"Before CUDA transfer - classifier device: {model.classifier.weight.device}")
+    
     model = model.cuda()
+    
+    print(f"After CUDA transfer - classifier weight sum: {model.classifier.weight.sum().item():.6f}")
+    print(f"After CUDA transfer - classifier bias sum: {model.classifier.bias.sum().item():.6f}")
+    print(f"After CUDA transfer - classifier device: {model.classifier.weight.device}")
+    print(f"Model ready for inference")
+    
+    # Final verification that our trained classifier is actually in the model
+    print(f"Final check - Model classifier ID: {id(model.classifier)}")
+    print(f"Final check - Classifier trainable params: {sum(p.numel() for p in model.classifier.parameters() if p.requires_grad)}")
+
+    # Test with a small sample to see if predictions make sense
+    print("\n=== TESTING MODEL PREDICTIONS ===")
+    test_input = torch.randint(0, 1000, (1, 10)).cuda()  # Random token IDs
+    test_attention = torch.ones(1, 10).cuda()
+    
+    with torch.no_grad():
+        model.eval()
+        test_output = model(input_ids=test_input, attention_mask=test_attention)
+        test_logits = test_output.logits[0, 0, :]  # First token's logits
+        test_probs = torch.softmax(test_logits, dim=0)
+        top_3_probs, top_3_indices = torch.topk(test_probs, 3)
+        print(f"Test prediction - Top 3 classes: {top_3_indices.cpu().numpy()}")
+        print(f"Test prediction - Top 3 probabilities: {top_3_probs.cpu().numpy()}")
+        print(f"Test prediction - Max probability: {test_probs.max().item():.4f}")
+        
+        # Check if predictions are too uniform (indicating random weights)
+        entropy = -(test_probs * torch.log(test_probs + 1e-10)).sum()
+        print(f"Test prediction - Entropy: {entropy.item():.4f} (lower=more confident)")
+    print("=== END MODEL TEST ===\n")
 
     raw_datasets = load_dataset(args.dataset_name, split="test")
 
@@ -516,12 +456,34 @@ if __name__ == "__main__":
                 predictions = torch.concatenate((predictions, preds))
                 labels = torch.concatenate((labels, labs))
 
+    # Load multiple metrics
     precision_metric = evaluate.load("precision")
-    metrics = precision_metric.compute(
-        references=labels[labels != -100],
-        predictions=predictions[labels != -100],
-        average="micro",
-    )
+    recall_metric = evaluate.load("recall") 
+    f1_metric = evaluate.load("f1")
+    accuracy_metric = evaluate.load("accuracy")
+    
+    # Filter out padding tokens
+    valid_mask = labels != -100
+    valid_labels = labels[valid_mask]
+    valid_predictions = predictions[valid_mask]
+    
+    # Compute all metrics
+    metrics = {}
+    metrics["precision"] = precision_metric.compute(
+        references=valid_labels, predictions=valid_predictions, average="micro"
+    )["precision"]
+    
+    metrics["recall"] = recall_metric.compute(
+        references=valid_labels, predictions=valid_predictions, average="micro"
+    )["recall"]
+    
+    metrics["f1"] = f1_metric.compute(
+        references=valid_labels, predictions=valid_predictions, average="micro"
+    )["f1"]
+    
+    metrics["accuracy"] = accuracy_metric.compute(
+        references=valid_labels, predictions=valid_predictions
+    )["accuracy"]
 
     with open(os.path.join(args.output_dir, "result_summary.json"), "w") as f:
         json.dump(metrics, f)

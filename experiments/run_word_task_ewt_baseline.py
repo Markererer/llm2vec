@@ -1,5 +1,6 @@
 """
 The script is adapted from https://huggingface.co/docs/transformers/en/tasks/token_classification
+Combined script for baseline models (like DeBERTa) on EWT dataset
 """
 
 import logging
@@ -353,7 +354,7 @@ class ModelArguments:
     model_class: str = field(
         default="custom",
         metadata={
-            "help": "One of the items 'custom' or 'auto'. 'custom' for LLM2Vec models and 'auto' for pretrained encoders such as BERT.",
+            "help": "One of the items 'custom' or 'auto'. 'custom' for LLM2Vec models and 'auto' for pretrained encoders such as BERT/DeBERTa.",
             "choices": ["custom", "auto"],
         },
     )
@@ -370,7 +371,7 @@ class ModelArguments:
             self.config_name is not None or self.model_name_or_path is not None
         ):
             raise ValueError(
-                "--config_overrides can't be used in combination with --config_name or --model_name_or_path"
+                "--config_overrides can't be used in combination with --config_name or --model_name_or --path"
             )
 
 
@@ -490,7 +491,6 @@ class DataTrainingArguments:
                     )
 
 
-# add more arguments
 @dataclass
 class CustomArguments:
     """
@@ -535,21 +535,15 @@ class ClassifierSaveCallback(TrainerCallback):
     """Callback to save classifier.pt for auto models (like DeBERTa) to maintain LLM2Vec compatibility"""
     
     def on_save(self, args, state, control, model=None, **kwargs):
-        if model is not None and hasattr(model, 'classifier'):
-            checkpoint_folder = f"checkpoint-{state.global_step}"
-            output_dir = os.path.join(args.output_dir, checkpoint_folder)
-            classifier_path = os.path.join(output_dir, "classifier.pt")
+        # Save classifier.pt whenever a checkpoint is saved
+        if model is not None:
+            classifier_path = os.path.join(args.output_dir, f"checkpoint-{state.global_step}", "classifier.pt")
             torch.save(model.classifier, classifier_path)
-            logger.info(f"Saved classifier.pt to {classifier_path}")
     
     def on_train_end(self, args, state, control, model=None, **kwargs):
-        # Also save at the end of training
-        if model is not None and hasattr(model, 'classifier'):
-            final_checkpoint = f"checkpoint-{state.global_step}"
-            output_dir = os.path.join(args.output_dir, final_checkpoint)
-            classifier_path = os.path.join(output_dir, "classifier.pt")
-            torch.save(model.classifier, classifier_path)
-            logger.info(f"Final classifier.pt saved to {classifier_path}")
+        # Save final classifier.pt
+        classifier_path = os.path.join(args.output_dir, "classifier.pt")
+        torch.save(model.classifier, classifier_path)
 
 
 class WordTaskTrainer(Trainer):
@@ -640,6 +634,7 @@ def main():
             cache_dir=model_args.cache_dir,
             token=model_args.token,
             streaming=data_args.streaming,
+            trust_remote_code=model_args.trust_remote_code
         )
         if "validation" not in raw_datasets.keys():
             raw_datasets["validation"] = load_dataset(
@@ -649,6 +644,7 @@ def main():
                 cache_dir=model_args.cache_dir,
                 token=model_args.token,
                 streaming=data_args.streaming,
+                trust_remote_code=model_args.trust_remote_code
             )
             raw_datasets["train"] = load_dataset(
                 data_args.dataset_name,
@@ -657,6 +653,7 @@ def main():
                 cache_dir=model_args.cache_dir,
                 token=model_args.token,
                 streaming=data_args.streaming,
+                trust_remote_code=model_args.trust_remote_code
             )
     else:
         data_files = {}
@@ -683,6 +680,7 @@ def main():
                 split=f"train[:{data_args.validation_split_percentage}%]",
                 cache_dir=model_args.cache_dir,
                 token=model_args.token,
+                trust_remote_code=model_args.trust_remote_code
             )
             raw_datasets["train"] = load_dataset(
                 extension,
@@ -690,22 +688,45 @@ def main():
                 split=f"train[{data_args.validation_split_percentage}%:]",
                 cache_dir=model_args.cache_dir,
                 token=model_args.token,
+                trust_remote_code=model_args.trust_remote_code
             )
 
-    assert (
-        data_args.dataset_name in LABELS
-        and custom_args.task in LABELS[data_args.dataset_name]
-    ), f"LABELS[{data_args.dataset_name}][{custom_args.task}] is not defined."
+    # Handle both conll2003 and universal_dependencies datasets
+    if data_args.dataset_name == "universal_dependencies":
+        # For EWT dataset, rename xpos to pos_tags and dynamically extract labels
+        raw_datasets = raw_datasets.rename_column("xpos", "pos_tags")
+        
+        # Dynamically extract labels from the dataset
+        all_labels = set()
+        for example in raw_datasets["train"]:
+            # Filter out None values
+            all_labels.update([label for label in example["pos_tags"] if label is not None])
 
-    config_kwargs = {
-        "num_labels": len(LABELS[data_args.dataset_name][custom_args.task]),
-        "id2label": {
-            i: lab
-            for (lab, i) in LABELS[data_args.dataset_name][custom_args.task].items()
-        },
-        "label2id": LABELS[data_args.dataset_name][custom_args.task],
-        "classifier_dropout": model_args.classifier_dropout,
-    }
+        # Sort labels for consistency
+        label_list = sorted(list(all_labels))
+
+        config_kwargs = {
+            "num_labels": len(label_list),
+            "id2label": {i: label for i, label in enumerate(label_list)},
+            "label2id": {label: i for i, label in enumerate(label_list)},
+            "classifier_dropout": model_args.classifier_dropout,
+        }
+    else:
+        # For conll2003 dataset, use hardcoded labels
+        assert (
+            data_args.dataset_name in LABELS
+            and custom_args.task in LABELS[data_args.dataset_name]
+        ), f"LABELS[{data_args.dataset_name}][{custom_args.task}] is not defined."
+
+        config_kwargs = {
+            "num_labels": len(LABELS[data_args.dataset_name][custom_args.task]),
+            "id2label": {
+                i: lab
+                for (lab, i) in LABELS[data_args.dataset_name][custom_args.task].items()
+            },
+            "label2id": LABELS[data_args.dataset_name][custom_args.task],
+            "classifier_dropout": model_args.classifier_dropout,
+        }
 
     tokenizer_kwargs = {
         "cache_dir": model_args.cache_dir,
@@ -789,25 +810,25 @@ def main():
             f"{model_args.model_class} is not implemented. Only 'auto' and 'custom' model_class options are valid."
         )
 
-    # only train classifier
+    # Only train classifier (frozen training)
     trainable_params = 0
     total_params = 0
     for n, p in list(model.named_parameters()):
-        if model_args.model_class == "auto":
-            # For auto models (like DeBERTa), only train the classifier head
+        if model_args.model_class == "custom":
             if "classifier" in n:
                 p.requires_grad = True
                 trainable_params += p.numel()
             else:
                 p.requires_grad = False
-        else:
-            # For custom models, train all parameters
-            p.requires_grad = True
-            trainable_params += p.numel()
+        elif model_args.model_class == "auto":
+            if "classifier" in n:
+                p.requires_grad = True
+                trainable_params += p.numel()
+            else:
+                p.requires_grad = False
         total_params += p.numel()
     
     logger.info(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
-
 
     if data_args.max_seq_length is None:
         max_seq_length = tokenizer.model_max_length
@@ -838,7 +859,7 @@ def main():
         )
 
         labels = []
-        words = []
+        words = [] if model_args.model_class == "custom" else None
         for i, label in enumerate(examples[task]):
             if custom_args.retroactive_labels in ["same_token"]:
                 word_ids = tokenized_inputs.word_ids(batch_index=i)
@@ -848,13 +869,17 @@ def main():
                     if word_idx is None:
                         label_ids.append(-100)
                     elif word_idx != previous_word_idx:
-                        label_ids.append(label[word_idx])
+                        if label[word_idx] is None:
+                            label_ids.append(-100)
+                        else:
+                            label_ids.append(config_kwargs["label2id"][label[word_idx]])
                     else:
                         label_ids.append(-100)
                     previous_word_idx = word_idx
                 labels.append(label_ids)
-                word_ids = [-1 if w is None else w for w in word_ids]
-                words.append(word_ids)
+                if model_args.model_class == "custom":
+                    word_ids = [-1 if w is None else w for w in word_ids]
+                    words.append(word_ids)
             elif custom_args.retroactive_labels == "next_token":
                 word_ids = tokenized_inputs.word_ids(batch_index=i)
                 previous_word_idx = None
@@ -863,15 +888,24 @@ def main():
                     if word_idx is None:
                         label_ids.append(-100)
                     elif word_idx != previous_word_idx:
-                        label_ids.append(label[word_idx])
+                        if label[word_idx] is None:
+                            label_ids.append(-100)
+                        else:
+                            label_ids.append(config_kwargs["label2id"][label[word_idx]])
                     else:
                         label_ids.append(-100)
                     previous_word_idx = word_idx
-                label_ids.append(-100)
-                labels.append(label_ids[1:])
+                
+                # Shift labels: each token predicts the next token's label
+                label_ids = label_ids[1:] + [-100]
+                
+                # Shift word_ids accordingly
                 word_ids = word_ids[1:] + [None]
                 word_ids = [-1 if w is None else w for w in word_ids]
-                words.append(word_ids)
+                
+                labels.append(label_ids)
+                if model_args.model_class == "custom":
+                    words.append(word_ids)
             else:
                 raise ValueError(
                     f"retroactive_labels {custom_args.retroactive_labels} is not implemented."
@@ -880,20 +914,42 @@ def main():
         tokenized_inputs["labels"] = labels
         if model_args.model_class == "custom":
             tokenized_inputs["token_type_ids"] = words
+        elif "token_type_ids" in tokenized_inputs:
+            # Remove token_type_ids for auto models if tokenizer added it automatically
+            del tokenized_inputs["token_type_ids"]
         return tokenized_inputs
 
-    tokenized_dataset = raw_datasets.map(
-        tokenize_and_align_labels,
-        batched=True,
-        remove_columns=list(LABELS[data_args.dataset_name].keys()) + ["tokens", "id"],
-        load_from_cache_file=not data_args.overwrite_cache,
-    )
+    # Handle different dataset structures for column removal
+    if data_args.dataset_name == "universal_dependencies":
+        # For EWT dataset, remove columns that exist in this dataset
+        expected_columns = ["input_ids", "attention_mask", "labels"]
+        if model_args.model_class == "custom":
+            expected_columns.append("token_type_ids")
+        columns_to_remove = [col for col in raw_datasets["train"].column_names if col not in expected_columns]
+        tokenized_dataset = raw_datasets.map(
+            tokenize_and_align_labels,
+            batched=True,
+            remove_columns=columns_to_remove,
+            load_from_cache_file=False,  # Disable cache to avoid schema issues
+        )
+    else:
+        # For conll2003 dataset
+        tokenized_dataset = raw_datasets.map(
+            tokenize_and_align_labels,
+            batched=True,
+            remove_columns=list(LABELS[data_args.dataset_name].keys()) + ["tokens", "id"],
+            load_from_cache_file=not data_args.overwrite_cache,
+        )
+        
     data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
     seqeval = evaluate.load("seqeval")
 
     def compute_metrics(p):
         predictions, labels = p
-        predictions = predictions[0]
+        # For auto models, predictions is already the logits tensor
+        # For custom models, predictions is a tuple with logits at index 0
+        if isinstance(predictions, tuple):
+            predictions = predictions[0]
         predictions = np.argmax(predictions, axis=2)
 
         true_predictions = [
