@@ -1,0 +1,17 @@
+{
+    "model_name_or_path": "princeton-nlp/Sheared-LLaMA-1.3B",
+    "peft_addr": "/home/maass/scripts/output/mntp/Sheared-LLaMA-1.3B/checkpoint-1000",
+    "cls_addr": "/home/maass/scripts/output/word-task/pos_tags/ShearedLlama/bi-mntp/ewt/checkpoint-1500",
+    "model_class": "custom",
+    "bidirectional": true,
+    "classifier_dropout": 0.1,
+    "torch_dtype": "bfloat16",
+    "attn_implementation": "eager",
+    "merge_subwords": true,
+    "retroactive_labels": "next_token",
+    "output_dir": "/home/maass/scripts/output/word-task/pos_tags/ShearedLlama/bi-mntp/ewt/results/checkpoint-1500",
+    "dataset_name": "universal_dependencies",
+    "dataset_config_name": "en_ewt",
+    "task": "pos_tags",
+    "max_seq_length": 512
+}

@@ -1,0 +1,15 @@
+{
+  "model_name_or_path": "microsoft/deberta-v3-large",
+  "model_class": "auto",
+  "cls_addr": "/home/maass/scripts/output/word-task/pos_tags/deberta_ewt_frozen/checkpoint-1500",
+  "bidirectional": true,
+  "merge_subwords": false,
+  "retroactive_labels": "same_token",
+  "dataset_name": "universal_dependencies",
+  "dataset_config_name": "en_ewt",
+  "task": "pos_tags",
+  "max_seq_length": 512,
+  "batch_size": 32,
+  "seed": 32,
+  "output_dir": "/home/maass/scripts/output/word-task/pos_tags/deberta_ewt_frozen/results/checkpoint-1500"
+}

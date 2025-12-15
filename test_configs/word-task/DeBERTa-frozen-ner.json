@@ -1,0 +1,13 @@
+{
+  "model_name_or_path": "microsoft/deberta-v3-large",
+  "model_class": "auto",
+  "cls_addr": "/home/maass/scripts/output/word-task/ner_tags/deberta_ner_frozen/checkpoint-6000",
+  "bidirectional": true,
+  "merge_subwords": false,
+  "dataset_name": "en_ewt",
+  "task": "ner_tags",
+  "max_seq_length": 512,
+  "batch_size": 32,
+  "seed": 32,
+  "output_dir": "/home/maass/scripts/output/word-task/ner_tags/deberta_ner_frozen/results/checkpoint-6000"
+}

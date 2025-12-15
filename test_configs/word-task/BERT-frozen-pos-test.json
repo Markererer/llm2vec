@@ -1,0 +1,13 @@
+{
+  "model_class": "auto",
+  "model_name_or_path": "google-bert/bert-large-cased",
+  "cls_addr": "/home/maass/scripts/output/word-task/pos_tags/bert_large_cased_frozen/checkpoint-5268",
+  "dataset_name": "conll2003",
+  "task": "pos_tags",
+  "max_seq_length": 512,
+  "batch_size": 32,
+  "seed": 42,
+  "merge_subwords": false,
+  "retroactive_labels": "next_token",
+  "output_dir": "/home/maass/scripts/output/word-task/pos_tags/bert_large_cased_frozen/results"
+}
