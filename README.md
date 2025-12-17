@@ -5,20 +5,6 @@ LLM2Vec is a simple recipe to convert decoder-only LLMs into text encoders. It c
   <img src="https://github.com/McGill-NLP/llm2vec/assets/12207571/48efd48a-431b-4625-8e0f-248a442e3839" width="75%" alt="LLM2Vec_figure1"/>
 </p>
 
-## Installation
-To use LLM2Vec, first install the llm2vec package from PyPI, followed by installing flash-attention:
-
-```bash
-pip install llm2vec
-pip install flash-attn --no-build-isolation
-```
-You can also directly install the latest version of llm2vec by cloning the repository: 
-
-```bash
-pip install -e .
-pip install flash-attn --no-build-isolation
-```
-
 ## Training 
 ### MNTP training
 To train the model with Masked Next Token Prediction (MNTP), you can use the `experiments/run_mntp.py` script. It is adapted from HuggingFace Masked Language Modeling (MLM) [script](https://github.com/huggingface/transformers/blob/51bcadc10a569847b93a30dbe3a077037ae63bad/examples/pytorch/language-modeling/run_mlm.py). To train the S-Llama-1.3B model with MNTP, run the following command:
